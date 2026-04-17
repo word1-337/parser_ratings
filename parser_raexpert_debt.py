@@ -18,6 +18,7 @@ import json
 import re
 import time
 from dataclasses import asdict, dataclass, replace
+from html.parser import HTMLParser
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
@@ -32,6 +33,107 @@ WITHDRAWN_RE = re.compile(r"\bотозван\b", re.IGNORECASE)
 PAGE_HINT_RE = re.compile(r"(?:[?&](?:PAGEN_[^=]+|page)=\d+)", re.IGNORECASE)
 RELEASE_HREF_RE = re.compile(r"href=[\"\']([^\"\']*/releases/[^\"\']*)[\"\']", re.IGNORECASE)
 TR_RE = re.compile(r"(?is)<tr[^>]*>(.*?)</tr>")
+
+
+class AnchorCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._current_href: str | None = None
+        self._current_chunks: list[str] = []
+        self.anchors: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        href = ""
+        for key, value in attrs:
+            if key.lower() == "href" and value:
+                href = value
+                break
+        self._current_href = href
+        self._current_chunks = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_href is None:
+            return
+        self._current_chunks.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or self._current_href is None:
+            return
+        text = _normalize_spaces("".join(self._current_chunks))
+        self.anchors.append((text, self._current_href))
+        self._current_href = None
+        self._current_chunks = []
+
+
+def parse_records_from_anchor_stream(source_html: str, base_url: str) -> list[RatingRecord]:
+    """Fallback для вёрстки без <tr>: извлекаем записи из последовательности ссылок."""
+    parser = AnchorCollector()
+    parser.feed(source_html)
+    anchors = [(txt, urljoin(base_url, href)) for txt, href in parser.anchors if txt]
+
+    issue_indices = [idx for idx, (txt, _) in enumerate(anchors) if txt.startswith("Облигации ")]
+    if not issue_indices:
+        return []
+
+    records: list[RatingRecord] = []
+    for pos, issue_idx in enumerate(issue_indices):
+        issue_text = anchors[issue_idx][0]
+        end = issue_indices[pos + 1] if pos + 1 < len(issue_indices) else len(anchors)
+        segment = anchors[issue_idx + 1 : end]
+        if not segment:
+            continue
+
+        joined = " ".join(item[0] for item in segment)
+        rating = _pick_rating(joined)
+        date_match = DATE_RE.search(joined)
+
+        release_candidates: list[tuple[date, str]] = []
+        for txt, href in segment:
+            if "/releases/" not in href:
+                continue
+            m = DATE_RE.search(txt)
+            if not m:
+                continue
+            release_candidates.append((_parse_date(m.group(0)), href))
+
+        if not rating or not date_match or not release_candidates:
+            continue
+
+        release_candidates.sort(key=lambda item: item[0], reverse=True)
+        release_day, release_href = release_candidates[0]
+
+        issuer = ""
+        for txt, href in segment:
+            if txt.startswith("Облигации "):
+                continue
+            if DATE_RE.search(txt):
+                continue
+            if _pick_rating(txt):
+                continue
+            if "/releases/" in href:
+                continue
+            issuer = txt
+            break
+
+        if not issuer:
+            issuer = _pick_issuer(joined)
+
+        if not issuer:
+            continue
+
+        records.append(
+            RatingRecord(
+                issue=issue_text,
+                issuer=issuer,
+                rating=rating,
+                date=release_day.strftime("%d.%m.%Y"),
+                press_release_url=release_href,
+            )
+        )
+
+    return deduplicate_records(records)
 
 
 @dataclass(slots=True, frozen=True)
@@ -253,6 +355,8 @@ def collect_records(max_pages: int | None = None, timeout_sec: int = DEFAULT_TIM
     for page_url in page_urls:
         current_html = first_html if page_url == BASE_URL else fetch_html(page_url, timeout_sec=timeout_sec)
         parsed = parse_records_from_html(current_html, BASE_URL)
+        if not parsed:
+            parsed = parse_records_from_anchor_stream(current_html, BASE_URL)
         if not parsed:
             parsed = parse_records_from_text(html_to_text(current_html), BASE_URL)
         all_records.extend(parsed)

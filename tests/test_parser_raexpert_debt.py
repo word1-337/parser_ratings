@@ -6,6 +6,7 @@ from parser_raexpert_debt import (
     deduplicate_records,
     find_pagination_urls,
     html_to_text,
+    parse_records_from_anchor_stream,
     parse_records_from_html,
     parse_records_from_text,
 )
@@ -33,6 +34,17 @@ SAMPLE_HTML = """
 </html>
 """.strip()
 
+
+
+
+SAMPLE_DIV_HTML = """
+<div>
+  <a href="/ratings/debt_inst/item-x">Облигации ПРИМЕР серии 01</a>
+  <a href="/ratings/company-x">ООО "ПРИМЕР"</a>
+  <a href="/releases/2026/apr16a">ruA-</a>
+  <a href="/releases/2026/apr16a">16.04.2026</a>
+</div>
+""".strip()
 
 SAMPLE_TEXT = """
 Эмиссия Рейтинг Прогноз Обновлен
@@ -63,6 +75,14 @@ class ParserTests(unittest.TestCase):
             {r.press_release_url for r in issuer_records},
             {"https://raexpert.ru/releases/2026/apr17x"},
         )
+
+
+    def test_parse_records_from_anchor_stream_without_table_rows(self):
+        records = parse_records_from_anchor_stream(SAMPLE_DIV_HTML, "https://raexpert.ru/ratings/debt_inst/")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].issuer, 'ООО "ПРИМЕР"')
+        self.assertEqual(records[0].rating, "ruA-")
+        self.assertEqual(records[0].press_release_url, "https://raexpert.ru/releases/2026/apr16a")
 
     def test_parse_records_from_text_fallback(self):
         records = parse_records_from_text(SAMPLE_TEXT, "https://raexpert.ru/ratings/debt_inst/")
